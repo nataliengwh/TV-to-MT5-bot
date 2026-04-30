@@ -1,28 +1,21 @@
-# TradingView → MetaApi → MT5 Webhook Bot
+# TradingView → MetaApi → MT5 Webhook Bot (Dual-Trade Strategy)
 
 A lightweight, self-hosted Python trading bot that runs entirely on a **Linux AWS instance**. It receives webhook alerts from TradingView and executes trades on your MetaTrader 5 account via the [MetaApi](https://metaapi.cloud) cloud service.
 
-```
-TradingView Alert
-      │  HTTPS POST (JSON)
-      ▼
-AWS Linux Server  ──  Flask app (this repo)
-      │  MetaApi Cloud SDK (Python)
-      ▼
-MetaApi Cloud  ──  manages the MT5 connection on your behalf
-      │
-      ▼
-MT5 Broker Account  (GO Markets, IC Markets, Pepperstone, etc.)
-```
+## Strategy Logic
 
-## Features
+This bot is hardcoded to execute a specific **Dual-Trade Strategy** for Gold (XAUUSD) and Bitcoin (BTCUSD).
 
-- Runs 100% on Linux — no Windows machine required
-- No third-party bridge subscriptions
-- Validates every incoming webhook with a secret passphrase
-- Supports `buy` and `sell` market orders with optional Stop Loss and Take Profit
-- Structured JSON logging to file and stdout
-- Systemd service file included for 24/7 auto-start
+When a signal is received, the bot simultaneously opens **two trades** with the same volume, but different Take Profit (TP) targets:
+*   **Trade 1:** Targets TP1.
+*   **Trade 2:** Targets TP2.
+*   Both trades share the same initial Stop Loss (SL).
+*   **Breakeven Trailing:** The bot runs a background monitor. As soon as Trade 1 hits TP1 and closes, the bot automatically moves the Stop Loss of Trade 2 to the entry price (breakeven).
+
+### Hardcoded Offsets
+The offsets are defined in absolute price terms in `app.py`:
+*   **XAUUSD:** TP1 = $5, TP2 = $10, SL = $10
+*   **BTCUSD:** TP1 = $40, TP2 = $80, SL = $80
 
 ---
 
@@ -88,32 +81,7 @@ In the AWS Console → **EC2 → Security Groups → Inbound Rules**, add:
 | HTTP | TCP | 80 | `54.218.53.128/32` |
 | HTTP | TCP | 80 | `52.32.178.7/32` |
 
-These are the four official TradingView webhook IP addresses. Restricting to these IPs prevents anyone else from hitting your endpoint.
-
-### 6. Test the server manually
-
-```bash
-# Load env vars and start the server
-export $(cat .env | xargs)
-python app.py
-```
-
-In a second terminal, send a test request:
-
-```bash
-curl -X POST http://localhost:80/webhook \
-  -H "Content-Type: application/json" \
-  -d '{
-    "secret": "change_me_to_something_strong",
-    "symbol": "XAUUSD",
-    "action": "buy",
-    "volume": 0.01
-  }'
-```
-
-You should see `{"status": "success", ...}` and a new position in your MT5 account.
-
-### 7. Run as a persistent service (24/7)
+### 6. Run as a persistent service (24/7)
 
 ```bash
 # Copy the systemd unit file
@@ -135,6 +103,8 @@ sudo journalctl -u tv-mt5-bot -f
 
 ## TradingView Alert Setup
 
+Because the bot calculates the TP and SL automatically based on the current price, your TradingView alert **must send the current price** using TradingView's dynamic variables (`{{close}}`).
+
 ### Webhook URL
 
 In the TradingView alert dialog, check **Webhook URL** and enter:
@@ -143,48 +113,33 @@ In the TradingView alert dialog, check **Webhook URL** and enter:
 http://YOUR_AWS_PUBLIC_IP/webhook
 ```
 
-> **Note:** TradingView requires 2-Factor Authentication (2FA) to be enabled on your account before webhooks can be used.
-
 ### Message (JSON Payload)
 
-Paste the following into the **Message** field of the alert. Adjust the values to match your strategy.
+Paste the following into the **Message** field of the alert. 
 
-**BUY signal with SL and TP:**
+**For a BUY signal:**
 ```json
 {
     "secret":  "change_me_to_something_strong",
     "symbol":  "XAUUSD",
     "action":  "buy",
     "volume":  0.05,
-    "sl":      3200.00,
-    "tp":      3280.00
+    "price":   {{close}}
 }
 ```
 
-**SELL signal without SL/TP:**
+**For a SELL signal:**
 ```json
 {
     "secret":  "change_me_to_something_strong",
     "symbol":  "BTCUSD",
     "action":  "sell",
-    "volume":  0.01
+    "volume":  0.01,
+    "price":   {{close}}
 }
 ```
 
-> **Tip:** Check the exact symbol name your broker uses in MT5 (e.g. some brokers use `XAUUSD.` or `BTCUSDm`). The `symbol` field must match exactly.
-
----
-
-## Payload Reference
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `secret` | string | Yes | Must match `WEBHOOK_SECRET` in your `.env` |
-| `symbol` | string | Yes | Instrument name as shown in MT5 Market Watch |
-| `action` | string | Yes | `buy` or `sell` |
-| `volume` | float | No | Lot size. Defaults to `0.01` |
-| `sl` | float | No | Stop Loss price |
-| `tp` | float | No | Take Profit price |
+> **Note:** `{{close}}` is a special TradingView placeholder. When the alert triggers, TradingView will automatically replace `{{close}}` with the actual numerical price (e.g., `2345.50`). Do not put quotes around `{{close}}`.
 
 ---
 
@@ -196,4 +151,3 @@ Paste the following into the **Message** field of the alert. Adjust the values t
 | `Symbol not found` | Check the exact symbol name in your MT5 Market Watch window |
 | MetaApi connection timeout | Ensure your account is **Deployed** in the MetaApi dashboard |
 | Port 80 not reachable | Check AWS Security Group inbound rules and the OS firewall (`sudo ufw status`) |
-| Gunicorn permission denied on port 80 | Run `sudo setcap 'cap_net_bind_service=+ep' /usr/bin/python3` or change the port to 8080 and use a reverse proxy |
