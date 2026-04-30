@@ -1,10 +1,12 @@
-import json
+import os
+import asyncio
 import logging
 from flask import Flask, request, jsonify
-import MetaTrader5 as mt5
-from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH, WEBHOOK_PASSPHRASE
+from metaapi_cloud_sdk import MetaApi
 
-# Configure logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -13,139 +15,158 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-def init_mt5():
-    """Initialize connection to MetaTrader 5."""
-    logging.info("Initializing MT5 connection...")
-    
-    # Initialize MT5
-    if not mt5.initialize(path=MT5_PATH):
-        logging.error(f"MT5 initialization failed, error code: {mt5.last_error()}")
-        return False
-        
-    # Login to account
-    authorized = mt5.login(
-        login=MT5_LOGIN,
-        password=MT5_PASSWORD,
-        server=MT5_SERVER
-    )
-    
-    if authorized:
-        logging.info(f"Successfully connected to MT5 account: {MT5_LOGIN}")
-        return True
-    else:
-        logging.error(f"Failed to connect to MT5 account: {MT5_LOGIN}, error code: {mt5.last_error()}")
-        return False
+# ---------------------------------------------------------------------------
+# Config (loaded from environment variables — see .env.example)
+# ---------------------------------------------------------------------------
+METAAPI_TOKEN   = os.environ.get('METAAPI_TOKEN', '')
+ACCOUNT_ID      = os.environ.get('METAAPI_ACCOUNT_ID', '')
+WEBHOOK_SECRET  = os.environ.get('WEBHOOK_SECRET', 'change_me')
 
-def execute_trade(symbol, action, volume, sl=None, tp=None):
-    """Execute a trade on MT5."""
-    # Ensure MT5 is connected
-    if not init_mt5():
-        return False, "MT5 connection failed"
-        
-    # Prepare symbol
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        logging.error(f"Symbol {symbol} not found")
-        return False, f"Symbol {symbol} not found"
-        
-    # Ensure symbol is visible in Market Watch
-    if not symbol_info.visible:
-        logging.info(f"Symbol {symbol} is not visible, trying to select it...")
-        if not mt5.symbol_select(symbol, True):
-            logging.error(f"Failed to select symbol {symbol}")
-            return False, f"Failed to select symbol {symbol}"
-            
-    # Determine order type and price
-    if action.lower() == 'buy':
-        order_type = mt5.ORDER_TYPE_BUY
-        price = mt5.symbol_info_tick(symbol).ask
-    elif action.lower() == 'sell':
-        order_type = mt5.ORDER_TYPE_SELL
-        price = mt5.symbol_info_tick(symbol).bid
-    else:
-        logging.error(f"Invalid action: {action}")
-        return False, f"Invalid action: {action}"
-        
-    # Prepare order request
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(volume),
-        "type": order_type,
-        "price": price,
-        "deviation": 20,
-        "magic": 234000,
-        "comment": "TradingView Webhook Bot",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    
-    # Add Stop Loss and Take Profit if provided
-    if sl is not None:
-        request["sl"] = float(sl)
-    if tp is not None:
-        request["tp"] = float(tp)
-        
-    # Send order to MT5
-    logging.info(f"Sending order: {request}")
-    result = mt5.order_send(request)
-    
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        logging.error(f"Order failed, retcode: {result.retcode}, comment: {result.comment}")
-        return False, f"Order failed: {result.comment}"
-        
-    logging.info(f"Order successfully placed! Ticket: {result.order}")
-    return True, f"Order placed successfully. Ticket: {result.order}"
+# ---------------------------------------------------------------------------
+# MetaApi helpers
+# ---------------------------------------------------------------------------
+
+async def _execute_trade(symbol: str, action: str, volume: float,
+                         sl: float | None, tp: float | None) -> dict:
+    """
+    Connect to the MetaApi cloud, open a market order, and return the result.
+    A fresh RPC connection is opened per request so the server can stay
+    stateless and handle concurrent webhooks safely.
+    """
+    api = MetaApi(METAAPI_TOKEN)
+    try:
+        account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+
+        # Deploy / wake the account if it is not already connected
+        if account.state not in ('DEPLOYING', 'DEPLOYED'):
+            logger.info("Deploying MetaApi account...")
+            await account.deploy()
+
+        logger.info("Waiting for broker connection...")
+        await account.wait_connected()
+
+        connection = account.get_rpc_connection()
+        await connection.connect()
+        await connection.wait_synchronized()
+
+        logger.info(f"Placing {action.upper()} {volume} lot(s) on {symbol} "
+                    f"| SL={sl} | TP={tp}")
+
+        kwargs = {}
+        if sl is not None:
+            kwargs['stop_loss'] = float(sl)
+        if tp is not None:
+            kwargs['take_profit'] = float(tp)
+
+        if action.lower() == 'buy':
+            result = await connection.create_market_buy_order(
+                symbol, float(volume), **kwargs,
+                options={'comment': 'TV-Bot', 'clientId': 'TV-Webhook-Bot'}
+            )
+        elif action.lower() == 'sell':
+            result = await connection.create_market_sell_order(
+                symbol, float(volume), **kwargs,
+                options={'comment': 'TV-Bot', 'clientId': 'TV-Webhook-Bot'}
+            )
+        else:
+            raise ValueError(f"Unknown action '{action}'. Must be 'buy' or 'sell'.")
+
+        logger.info(f"Trade result: {result}")
+        return result
+
+    finally:
+        # Always close the connection to free resources
+        try:
+            await connection.close()
+        except Exception:
+            pass
+
+
+def run_trade(symbol, action, volume, sl, tp):
+    """Run the async trade coroutine from synchronous Flask context."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(
+            _execute_trade(symbol, action, volume, sl, tp)
+        )
+    finally:
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Endpoint to receive TradingView webhooks."""
+    """
+    Receives TradingView alert webhooks.
+
+    Expected JSON payload:
+    {
+        "secret":  "your_webhook_secret",
+        "symbol":  "XAUUSD",
+        "action":  "buy",          // or "sell"
+        "volume":  0.05,           // lot size (optional, default 0.01)
+        "sl":      2300.00,        // stop loss price (optional)
+        "tp":      2380.00         // take profit price (optional)
+    }
+    """
     try:
-        # Parse JSON payload
-        data = request.get_json()
-        logging.info(f"Received webhook payload: {data}")
-        
-        # Verify passphrase for security
-        if data.get('passphrase') != WEBHOOK_PASSPHRASE:
-            logging.warning("Unauthorized webhook attempt: Invalid passphrase")
+        data = request.get_json(force=True)
+        logger.info(f"Incoming webhook: {data}")
+
+        # ── Security check ──────────────────────────────────────────────────
+        if data.get('secret') != WEBHOOK_SECRET:
+            logger.warning("Rejected webhook: invalid secret")
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
-            
-        # Extract trade parameters
+
+        # ── Parameter validation ─────────────────────────────────────────────
         symbol = data.get('symbol')
-        action = data.get('action')
-        volume = data.get('volume', 0.01) # Default to 0.01 lots if not specified
-        sl = data.get('sl')
-        tp = data.get('tp')
-        
-        if not symbol or not action:
-            logging.error("Missing required parameters (symbol or action)")
-            return jsonify({"status": "error", "message": "Missing required parameters"}), 400
-            
-        # Execute trade
-        success, message = execute_trade(symbol, action, volume, sl, tp)
-        
-        if success:
-            return jsonify({"status": "success", "message": message}), 200
-        else:
-            return jsonify({"status": "error", "message": message}), 500
-            
+        action = data.get('action', '').lower()
+        volume = float(data.get('volume', 0.01))
+        sl     = data.get('sl')
+        tp     = data.get('tp')
+
+        if not symbol:
+            return jsonify({"status": "error", "message": "Missing 'symbol'"}), 400
+        if action not in ('buy', 'sell'):
+            return jsonify({"status": "error",
+                            "message": "'action' must be 'buy' or 'sell'"}), 400
+        if volume <= 0:
+            return jsonify({"status": "error",
+                            "message": "'volume' must be greater than 0"}), 400
+
+        # ── Execute trade ────────────────────────────────────────────────────
+        result = run_trade(symbol, action, volume, sl, tp)
+
+        return jsonify({
+            "status":      "success",
+            "stringCode":  result.get('stringCode'),
+            "orderId":     result.get('orderId'),
+        }), 200
+
     except Exception as e:
-        logging.error(f"Error processing webhook: {str(e)}")
+        logger.error(f"Error processing webhook: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/', methods=['GET'])
-def health_check():
-    """Simple health check endpoint."""
-    return jsonify({"status": "online", "message": "TradingView to MT5 Webhook Bot is running"}), 200
 
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({"status": "online",
+                    "message": "TradingView → MetaApi → MT5 bot is running"}), 200
+
+
+# ---------------------------------------------------------------------------
+# Entry point (development only — use Gunicorn in production)
+# ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    # Initialize MT5 on startup
-    init_mt5()
-    
-    # Run Flask app
-    # Note: In production, use a WSGI server like Waitress or Gunicorn
-    logging.info("Starting Flask webhook server on port 80...")
     app.run(host='0.0.0.0', port=80)
