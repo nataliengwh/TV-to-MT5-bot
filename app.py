@@ -332,5 +332,4 @@ def health():
 
 
 if __name__ == '__main__':
-    # Port 8080 avoids the need for root/sudo on Linux
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8080)  # iptables redirects port 80 -> 8080 (see README)
