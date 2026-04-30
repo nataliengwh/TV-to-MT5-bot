@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+from datetime import datetime
+import pytz
 from flask import Flask, request, jsonify
 from metaapi_cloud_sdk import MetaApi
 
@@ -21,6 +23,45 @@ logger = logging.getLogger(__name__)
 # Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Trading hours filter (HKT = UTC+8)
+# ---------------------------------------------------------------------------
+HKT = pytz.timezone('Asia/Hong_Kong')
+
+# Blocked windows: list of (start_hour_min, end_hour_min) in HKT, weekdays only (Mon=0 … Fri=4)
+# Times are inclusive-start, exclusive-end, expressed as (hour, minute) tuples.
+BLOCKED_WINDOWS = [
+    ((21, 30), (22, 0)),   # 21:30 – 22:00 HKT
+    ((0,  0),  (8,  0)),   # 00:00 – 08:00 HKT
+]
+
+def is_trading_allowed() -> tuple[bool, str]:
+    """
+    Returns (True, '') if trading is allowed right now,
+    or (False, reason_string) if it is blocked.
+    """
+    now_hkt = datetime.now(HKT)
+    weekday = now_hkt.weekday()  # Monday=0, Sunday=6
+
+    # Block all weekend signals (Saturday=5, Sunday=6)
+    if weekday >= 5:
+        return False, f"Weekend trading blocked ({now_hkt.strftime('%A %H:%M HKT')})"
+
+    # Check each blocked window
+    current_hm = (now_hkt.hour, now_hkt.minute)
+    for (start_h, start_m), (end_h, end_m) in BLOCKED_WINDOWS:
+        start_total = start_h * 60 + start_m
+        end_total   = end_h   * 60 + end_m
+        current_total = current_hm[0] * 60 + current_hm[1]
+        if start_total <= current_total < end_total:
+            return False, (
+                f"Signal blocked: outside trading hours "
+                f"({now_hkt.strftime('%H:%M HKT')} falls in "
+                f"{start_h:02d}:{start_m:02d}–{end_h:02d}:{end_m:02d} HKT blackout window)"
+            )
+
+    return True, ""
 
 # ---------------------------------------------------------------------------
 # Config
@@ -260,6 +301,12 @@ def webhook():
             return jsonify({"status": "error", "message": "Missing 'price'. TV must send current price."}), 400
 
         price = float(price)
+
+        # ── Trading hours check ──────────────────────────────────────────────
+        allowed, reason = is_trading_allowed()
+        if not allowed:
+            logger.warning(f"Trade blocked: {reason}")
+            return jsonify({"status": "blocked", "message": reason}), 200
 
         # ── Execute trade ────────────────────────────────────────────────────
         result = run_trade(symbol, action, volume, price)
