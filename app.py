@@ -5,6 +5,10 @@ from datetime import datetime
 import pytz
 from flask import Flask, request, jsonify
 from metaapi_cloud_sdk import MetaApi
+from dotenv import load_dotenv
+
+# Load .env file automatically — no need to manually export variables
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -328,4 +332,5 @@ def health():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80)
+    # Port 8080 avoids the need for root/sudo on Linux
+    app.run(host='0.0.0.0', port=8080)
