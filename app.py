@@ -138,7 +138,8 @@ async def _execute_dual_trade(symbol: str, action: str, volume: float, current_p
     is_buy  = action.lower() == 'buy'
 
     # Re-synchronise if the connection dropped
-    if not _connection.synchronized:
+    # is_synchronized() is on the underlying connection object, not the instance wrapper
+    if not _connection._meta_api_connection.is_synchronized():
         logger.info("Connection not synchronised — re-synchronising...")
         await _connection.wait_synchronized()
 
