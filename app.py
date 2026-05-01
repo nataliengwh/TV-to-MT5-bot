@@ -135,12 +135,33 @@ async def _execute_dual_trade(symbol: str, action: str, volume: float, current_p
         await connection.connect()
         await connection.wait_synchronized()
 
-        # Round prices to 2 decimal places (sufficient for XAUUSD and BTCUSD)
+        # Fetch the live price from the broker so SL/TP are calculated from the
+        # actual execution price, not the (potentially stale) TradingView close price.
+        live_price_data = await connection.get_symbol_price(symbol)
+        if is_buy:
+            entry_price = live_price_data['ask']   # BUY fills at ask
+        else:
+            entry_price = live_price_data['bid']   # SELL fills at bid
+
+        logger.info(f"TV price: {current_price} | Live broker price: {entry_price} (using this for SL/TP)")
+
+        # Recalculate SL/TP from live price
+        if is_buy:
+            tp1_price = entry_price + config["tp1_offset"]
+            tp2_price = entry_price + config["tp2_offset"]
+            sl_price  = entry_price - config["sl_offset"]
+        else:
+            tp1_price = entry_price - config["tp1_offset"]
+            tp2_price = entry_price - config["tp2_offset"]
+            sl_price  = entry_price + config["sl_offset"]
+
+        # Round to 2 decimal places (sufficient for XAUUSD and BTCUSD)
         tp1_price = round(tp1_price, 2)
         tp2_price = round(tp2_price, 2)
         sl_price  = round(sl_price,  2)
+        entry_price = round(entry_price, 2)
 
-        logger.info(f"Placing DUAL {action.upper()} {volume} lot(s) on {symbol} @ ~{current_price}")
+        logger.info(f"Placing DUAL {action.upper()} {volume} lot(s) on {symbol} @ {entry_price}")
         logger.info(f"Trade 1 (TP1): TP={tp1_price}, SL={sl_price}")
         logger.info(f"Trade 2 (TP2): TP={tp2_price}, SL={sl_price}")
 
