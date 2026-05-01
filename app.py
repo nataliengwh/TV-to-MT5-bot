@@ -135,30 +135,44 @@ async def _execute_dual_trade(symbol: str, action: str, volume: float, current_p
         await connection.connect()
         await connection.wait_synchronized()
 
-        logger.info(f"Placing DUAL {action.upper()} {volume} lot(s) on {symbol} @ ~{current_price}")
-        logger.info(f"Trade 1: TP={tp1_price}, SL={sl_price}")
-        logger.info(f"Trade 2: TP={tp2_price}, SL={sl_price}")
+        # Round prices to 2 decimal places (sufficient for XAUUSD and BTCUSD)
+        tp1_price = round(tp1_price, 2)
+        tp2_price = round(tp2_price, 2)
+        sl_price  = round(sl_price,  2)
 
-        # Execute Trade 1
+        logger.info(f"Placing DUAL {action.upper()} {volume} lot(s) on {symbol} @ ~{current_price}")
+        logger.info(f"Trade 1 (TP1): TP={tp1_price}, SL={sl_price}")
+        logger.info(f"Trade 2 (TP2): TP={tp2_price}, SL={sl_price}")
+
+        # Execute Trade 1 (TP1 leg)
+        # comment + clientId combined must be <= 26 chars (MetaApi limit)
         if is_buy:
             res1 = await connection.create_market_buy_order(
-                symbol, volume, stop_loss=sl_price, take_profit=tp1_price,
-                options={'comment': 'TV-Bot-TP1', 'clientId': 'TV-Bot-TP1'}
+                symbol, volume,
+                stop_loss=sl_price,
+                take_profit=tp1_price,
+                options={'comment': 'TP1'}
             )
-            # Execute Trade 2
+            # Execute Trade 2 (TP2 leg)
             res2 = await connection.create_market_buy_order(
-                symbol, volume, stop_loss=sl_price, take_profit=tp2_price,
-                options={'comment': 'TV-Bot-TP2', 'clientId': 'TV-Bot-TP2'}
+                symbol, volume,
+                stop_loss=sl_price,
+                take_profit=tp2_price,
+                options={'comment': 'TP2'}
             )
         else:
             res1 = await connection.create_market_sell_order(
-                symbol, volume, stop_loss=sl_price, take_profit=tp1_price,
-                options={'comment': 'TV-Bot-TP1', 'clientId': 'TV-Bot-TP1'}
+                symbol, volume,
+                stop_loss=sl_price,
+                take_profit=tp1_price,
+                options={'comment': 'TP1'}
             )
-            # Execute Trade 2
+            # Execute Trade 2 (TP2 leg)
             res2 = await connection.create_market_sell_order(
-                symbol, volume, stop_loss=sl_price, take_profit=tp2_price,
-                options={'comment': 'TV-Bot-TP2', 'clientId': 'TV-Bot-TP2'}
+                symbol, volume,
+                stop_loss=sl_price,
+                take_profit=tp2_price,
+                options={'comment': 'TP2'}
             )
 
         logger.info(f"Trade 1 result: {res1.get('stringCode')} (ID: {res1.get('orderId')})")
