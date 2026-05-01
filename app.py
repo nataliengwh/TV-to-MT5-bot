@@ -239,7 +239,8 @@ def webhook():
         "symbol":  "XAUUSD",
         "action":  "buy",
         "volume":  0.05,
-        "price":   3300.00
+        "price":   3300.00,
+        "filter":  true        // optional — true = apply trading hours filter, false (or omit) = bypass filter
     }
     """
     try:
@@ -266,10 +267,18 @@ def webhook():
 
         price = float(price)
 
-        allowed, reason = is_trading_allowed()
-        if not allowed:
-            logger.warning(f"Trade blocked: {reason}")
-            return jsonify({"status": "blocked", "message": reason}), 200
+        # Trading hours filter — only applied when "filter": true is sent in the payload.
+        # Omitting the field or setting it to false bypasses the filter entirely.
+        apply_filter = str(data.get('filter', 'false')).lower() in ('true', '1', 'yes')
+        if apply_filter:
+            allowed, reason = is_trading_allowed()
+            if not allowed:
+                logger.warning(f"Trade blocked by hours filter: {reason}")
+                return jsonify({"status": "blocked", "message": reason}), 200
+            else:
+                logger.info("Trading hours filter: ACTIVE and within allowed window — proceeding")
+        else:
+            logger.info("Trading hours filter: BYPASSED (filter=false or not set)")
 
         if not _connection_ready.is_set():
             return jsonify({"status": "error", "message": "MetaApi connection not ready yet, try again in a moment"}), 503
