@@ -123,10 +123,15 @@ async def _execute_dual_trade(symbol: str, action: str, volume: float, current_p
 
     try:
         account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+        logger.info(f"Account state: {account.state}")
 
-        if account.state not in ('DEPLOYING', 'DEPLOYED'):
-            logger.info("Deploying MetaApi account...")
+        # Only call deploy() if the account is truly undeployed.
+        # If it is already DEPLOYED or DEPLOYING, calling deploy() returns 403 — skip it.
+        if account.state in ('UNDEPLOYED', 'UNDEPLOYING'):
+            logger.info("Account is undeployed — deploying now...")
             await account.deploy()
+        else:
+            logger.info(f"Account already in state '{account.state}' — skipping deploy()")
 
         logger.info("Waiting for broker connection...")
         await account.wait_connected()
