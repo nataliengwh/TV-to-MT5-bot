@@ -30,13 +30,16 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Trading hours filter (HKT = UTC+8)
+# Timezone
 # ---------------------------------------------------------------------------
 HKT = pytz.timezone('Asia/Hong_Kong')
 
+# ---------------------------------------------------------------------------
+# Trading hours filter (HKT)
+# ---------------------------------------------------------------------------
 BLOCKED_WINDOWS = [
-    ((21, 30), (22, 0)),   # 21:30 – 22:00 HKT
-    ((0,  0),  (8,  0)),   # 00:00 – 08:00 HKT
+    ((21, 30), (22, 0)),   # 21:30 – 22:00 HKT  (NY open volatility)
+    ((0,  0),  (8,  0)),   # 00:00 – 08:00 HKT  (overnight low liquidity)
 ]
 
 def is_trading_allowed() -> tuple:
@@ -61,6 +64,12 @@ METAAPI_TOKEN  = os.environ.get('METAAPI_TOKEN', '')
 ACCOUNT_ID     = os.environ.get('METAAPI_ACCOUNT_ID', '')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'change_me')
 
+# Daily auto-close config for XAUUSD (gold market gap protection)
+# Set XAUUSD_CLOSE_TIME in .env as "HH:MM" in HKT, e.g. "04:59"
+# US summer hours (EDT, Mar–Nov): gap at ~05:00 HKT → close at 04:59
+# US winter hours (EST, Nov–Mar): gap at ~06:00 HKT → close at 05:59
+XAUUSD_CLOSE_TIME = os.environ.get('XAUUSD_CLOSE_TIME', '04:59')  # HKT
+
 STRATEGY_CONFIG = {
     "XAUUSD": {"tp1_offset": 5.0,  "tp2_offset": 10.0, "sl_offset": 10.0},
     "BTCUSD": {"tp1_offset": 40.0, "tp2_offset": 80.0, "sl_offset": 80.0},
@@ -69,26 +78,18 @@ STRATEGY_CONFIG = {
 # ---------------------------------------------------------------------------
 # Persistent async event loop + MetaApi connection
 # ---------------------------------------------------------------------------
-# A single background thread runs the asyncio event loop for the lifetime of
-# the process. The MetaApi connection is established ONCE at startup and reused
-# for every webhook — this avoids the 10-30 second reconnect delay that caused
-# TradingView's 5-second webhook timeout.
-# ---------------------------------------------------------------------------
-
 _loop: asyncio.AbstractEventLoop = None
-_connection = None          # RPC connection (reused)
-_api = None                 # MetaApi instance (reused)
-_connection_ready = threading.Event()   # set when connection is ready
+_connection = None
+_api = None
+_connection_ready = threading.Event()
 
 
 def _start_background_loop(loop: asyncio.AbstractEventLoop):
-    """Run the asyncio loop forever in a daemon thread."""
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
 
 async def _init_metaapi():
-    """Connect to MetaApi once and keep the connection alive."""
     global _api, _connection
     _api = MetaApi(METAAPI_TOKEN)
     account = await _api.metatrader_account_api.get_account(ACCOUNT_ID)
@@ -100,26 +101,117 @@ async def _init_metaapi():
     await _connection.wait_synchronized()
     logger.info("MetaApi connection established and synchronised. Bot is ready.")
     _connection_ready.set()
+    # Start the daily XAUUSD close scheduler
+    asyncio.ensure_future(_daily_xauusd_close_scheduler(), loop=_loop)
 
 
 def start_persistent_connection():
-    """Called once at startup: create the background loop and connect."""
     global _loop
     _loop = asyncio.new_event_loop()
     t = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True)
     t.start()
-    # Schedule the async init on the background loop
     future = asyncio.run_coroutine_threadsafe(_init_metaapi(), _loop)
     try:
-        future.result(timeout=120)   # wait up to 2 min for initial connection
+        future.result(timeout=120)
     except Exception as e:
         logger.error(f"Failed to establish MetaApi connection at startup: {e}")
 
 
 def run_async(coro):
-    """Submit a coroutine to the persistent background loop and wait for result."""
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=30)   # 30-second timeout per trade
+    return future.result(timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# Daily XAUUSD close scheduler
+# ---------------------------------------------------------------------------
+
+async def _daily_xauusd_close_scheduler():
+    """
+    Runs forever in the background. Every minute, checks if it is time to
+    close all XAUUSD positions (weekdays only, at XAUUSD_CLOSE_TIME HKT).
+    This protects against the gold market daily gap (COMEX close ~05:00 HKT
+    in US summer hours).
+
+    Configure close time via XAUUSD_CLOSE_TIME in .env (default: "04:59").
+    US summer (EDT, Mar–Nov): use "04:59"
+    US winter (EST, Nov–Mar): use "05:59"
+    """
+    try:
+        close_h, close_m = [int(x) for x in XAUUSD_CLOSE_TIME.split(':')]
+    except Exception:
+        logger.error(f"Invalid XAUUSD_CLOSE_TIME format '{XAUUSD_CLOSE_TIME}'. Expected HH:MM. Using default 04:59.")
+        close_h, close_m = 4, 59
+
+    logger.info(f"[DailyClose] XAUUSD auto-close scheduler started. Will close positions at {close_h:02d}:{close_m:02d} HKT on weekdays.")
+    fired_today = None   # tracks the date we last fired, to avoid double-firing
+
+    while True:
+        await asyncio.sleep(30)   # check every 30 seconds
+        try:
+            now_hkt = datetime.now(HKT)
+            today   = now_hkt.date()
+
+            # Only fire on weekdays (Mon–Fri)
+            if now_hkt.weekday() >= 5:
+                continue
+
+            # Check if it's time (within the target minute) and hasn't fired today
+            if (now_hkt.hour == close_h and
+                    now_hkt.minute == close_m and
+                    fired_today != today):
+                fired_today = today
+                logger.info(f"[DailyClose] {now_hkt.strftime('%H:%M HKT')} — closing all XAUUSD positions before market gap...")
+                await _close_all_xauusd_positions()
+
+        except Exception as e:
+            logger.error(f"[DailyClose] Scheduler error: {e}")
+
+
+async def _close_all_xauusd_positions():
+    """Close all open XAUUSD positions at market price."""
+    try:
+        if not _connection_ready.is_set():
+            logger.warning("[DailyClose] Connection not ready — skipping close.")
+            return
+
+        positions = await _connection.get_positions()
+        xau_positions = [p for p in positions if 'XAU' in p.get('symbol', '').upper()]
+
+        if not xau_positions:
+            logger.info("[DailyClose] No open XAUUSD positions to close.")
+            return
+
+        logger.info(f"[DailyClose] Found {len(xau_positions)} XAUUSD position(s) to close.")
+
+        for pos in xau_positions:
+            pos_id     = pos['id']
+            pos_type   = pos['type']   # POSITION_TYPE_BUY or POSITION_TYPE_SELL
+            pos_volume = pos['volume']
+            pos_symbol = pos['symbol']
+
+            try:
+                if pos_type == 'POSITION_TYPE_BUY':
+                    result = await _connection.create_market_sell_order(
+                        pos_symbol, pos_volume,
+                        options={'comment': 'DailyClose'}
+                    )
+                else:
+                    result = await _connection.create_market_buy_order(
+                        pos_symbol, pos_volume,
+                        options={'comment': 'DailyClose'}
+                    )
+                logger.info(
+                    f"[DailyClose] Closed position {pos_id} ({pos_type} {pos_volume} {pos_symbol}): "
+                    f"{result.get('stringCode')}"
+                )
+            except Exception as e:
+                logger.error(f"[DailyClose] Failed to close position {pos_id}: {e}")
+
+        logger.info("[DailyClose] All XAUUSD positions processed.")
+
+    except Exception as e:
+        logger.error(f"[DailyClose] Error fetching positions: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +226,10 @@ async def _execute_dual_trade(symbol: str, action: str, volume: float, current_p
     if not base_symbol or base_symbol not in STRATEGY_CONFIG:
         raise ValueError(f"No strategy config for symbol: {symbol}")
 
-    config  = STRATEGY_CONFIG[base_symbol]
-    is_buy  = action.lower() == 'buy'
+    config = STRATEGY_CONFIG[base_symbol]
+    is_buy = action.lower() == 'buy'
 
     # Re-synchronise if the connection dropped
-    # is_synchronized() is on the underlying connection object, not the instance wrapper
     if not _connection._meta_api_connection.is_synchronized():
         logger.info("Connection not synchronised — re-synchronising...")
         await _connection.wait_synchronized()
@@ -177,7 +268,7 @@ async def _execute_dual_trade(symbol: str, action: str, volume: float, current_p
     logger.info(f"Trade 1 result: {res1.get('stringCode')} (positionId: {res1.get('positionId')})")
     logger.info(f"Trade 2 result: {res2.get('stringCode')} (positionId: {res2.get('positionId')})")
 
-    # Start breakeven monitor as a background task on the same loop
+    # Start breakeven monitor
     pos1_id = res1.get('positionId')
     pos2_id = res2.get('positionId')
     if pos1_id and pos2_id:
@@ -193,10 +284,9 @@ async def _execute_dual_trade(symbol: str, action: str, volume: float, current_p
 async def _monitor_breakeven(tp1_pos_id: str, tp2_pos_id: str, breakeven_price: float):
     """
     Polls every 10 seconds. When TP1 position closes (TP hit), moves TP2 SL to breakeven.
-    Runs entirely on the persistent background loop — does NOT block Flask.
     """
     logger.info(f"[Monitor] Watching TP1 pos={tp1_pos_id}, TP2 pos={tp2_pos_id}")
-    max_checks = 48 * 360   # 48 hours at 10-second intervals
+    max_checks = 48 * 360   # 48 hours
 
     for _ in range(max_checks):
         await asyncio.sleep(10)
@@ -205,7 +295,6 @@ async def _monitor_breakeven(tp1_pos_id: str, tp2_pos_id: str, breakeven_price: 
             pos_ids   = {p['id'] for p in positions}
 
             if tp1_pos_id not in pos_ids:
-                # TP1 closed
                 if tp2_pos_id in pos_ids:
                     tp2_pos = next(p for p in positions if p['id'] == tp2_pos_id)
                     await _connection.modify_position(
@@ -240,7 +329,7 @@ def webhook():
         "action":  "buy",
         "volume":  0.05,
         "price":   3300.00,
-        "filter":  true        // optional — true = apply trading hours filter, false (or omit) = bypass filter
+        "filter":  true        // optional — true = apply trading hours filter, false/omit = bypass
     }
     """
     try:
@@ -267,8 +356,6 @@ def webhook():
 
         price = float(price)
 
-        # Trading hours filter — only applied when "filter": true is sent in the payload.
-        # Omitting the field or setting it to false bypasses the filter entirely.
         apply_filter = str(data.get('filter', 'false')).lower() in ('true', '1', 'yes')
         if apply_filter:
             allowed, reason = is_trading_allowed()
@@ -299,9 +386,12 @@ def webhook():
 @app.route('/', methods=['GET'])
 def health():
     ready = _connection_ready.is_set()
+    now_hkt = datetime.now(HKT)
     return jsonify({
         "status": "online",
         "metaapi_connected": ready,
+        "server_time_hkt": now_hkt.strftime('%Y-%m-%d %H:%M:%S HKT'),
+        "xauusd_daily_close_time": f"{XAUUSD_CLOSE_TIME} HKT (weekdays)",
         "message": "Bot ready" if ready else "Connecting to MetaApi..."
     }), 200
 
